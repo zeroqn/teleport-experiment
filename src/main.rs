@@ -142,64 +142,53 @@ impl P2pOid {
     }
 }
 
-struct P2PSelfSignedCertificate;
+struct P2PSelfSignedCertificate {
+    der_cert: rcgen::Certificate,
+}
 
 impl P2PSelfSignedCertificate {
-    // TODO: remove assert!
-    pub fn salt_pk(cert_pk: &[u8], buf: &mut [u8]) -> usize {
-        let prefix = CERT_P2P_EXT_PK_PREFIX;
-        let spk_len = prefix.len() + cert_pk.len();
+    pub fn from_host(host_sk: &[u8], host_pk: &[u8]) -> Result<Self, Box<dyn StdError>> {
+        // Generate random certificate keypair
+        let cert_kp = rcgen::KeyPair::generate(&rcgen::PKCS_ECDSA_P384_SHA384)?;
+        let cert_pk = cert_kp.public_key_raw();
 
-        assert!(
-            spk_len < buf.len(),
-            "certificate public key size {} is bigger than {} bytes",
-            spk_len,
-            buf.len()
-        );
-
-        buf[..prefix.len()].copy_from_slice(prefix.as_bytes());
-        buf[prefix.len()..spk_len].copy_from_slice(cert_pk);
-
-        spk_len
-    }
-
-    pub fn gen_proof(
-        cert_pk: &[u8],
-        host_sk: &[u8],
-        buf: &mut [u8],
-    ) -> Result<usize, X509DerCertificateError> {
-        let len = P2PSelfSignedCertificate::salt_pk(cert_pk, buf);
-        let salt_pk = &buf[..len];
-
-        let host_sk = secp256k1::SecretKey::from_slice(host_sk)?;
-        let msg = secp256k1::Message::from_slice(&keccak256_hash(salt_pk))?;
-
-        let sig = SECP256K1.sign(&msg, &host_sk);
-        let ser_sig = sig.serialize_compact();
-
-        buf[..ser_sig.len()].copy_from_slice(&ser_sig);
-        Ok(ser_sig.len())
-    }
-
-    pub fn verify_proof(
-        proof: &[u8],
-        cert_pk: &[u8],
-        host_pk: &[u8],
-    ) -> Result<(), X509DerCertificateError> {
         let mut buf = [0u8; 1000];
+        let len = Self::gen_proof(cert_pk, host_sk, &mut buf)?;
+        let cert_proof = &buf[..len];
 
-        let host_pk = secp256k1::PublicKey::from_slice(host_pk)?;
-        let sig = secp256k1::Signature::from_compact(proof)?;
+        // TODO: Wait prost bytes 0.5 pr merged
+        let mut encoded_key = Vec::new();
 
-        let len = P2PSelfSignedCertificate::salt_pk(cert_pk, &mut buf);
-        let salt_pk = &buf[..len];
+        // Now we need to produce this proof extension
+        let signed_key = SignedKey::new(host_pk, cert_proof);
+        <SignedKey as prost::Message>::encode(&signed_key, &mut encoded_key)?;
+        let p2p_ext = CustomExtension::from_oid_content(CERT_P2P_EXT_OID, encoded_key);
 
-        let msg = secp256k1::Message::from_slice(&keccak256_hash(salt_pk))?;
+        let peer_id = PeerId::from_slice(host_pk)?;
 
-        SECP256K1.verify(&msg, &sig, &host_pk).map_err(From::from)
+        // Now we're ready to produce our self-signed certificate
+        let mut cert_params = CertificateParams::default();
+        // Note: use peer id as dns name isn't defined in spec
+        cert_params.subject_alt_names = vec![rcgen::SanType::DnsName(peer_id.string())];
+        cert_params.custom_extensions = vec![p2p_ext];
+        cert_params.is_ca = rcgen::IsCa::SelfSignedOnly;
+        cert_params.alg = &rcgen::PKCS_ECDSA_P384_SHA384;
+        cert_params.key_pair = Some(cert_kp);
+
+        let cert = rcgen::Certificate::from_params(cert_params)?;
+
+        Ok(P2PSelfSignedCertificate { der_cert: cert })
     }
 
-    fn verify_cert_ext(bytes: &[u8]) -> Result<Vec<u8>, X509DerCertificateError> {
+    pub fn serialize_der(&self) -> Result<Vec<u8>, Box<dyn StdError>> {
+        Ok(self.der_cert.serialize_der()?)
+    }
+
+    pub fn serialize_private_key_der(&self) -> Vec<u8> {
+        self.der_cert.serialize_private_key_der()
+    }
+
+    pub fn verify_cert_ext(bytes: &[u8]) -> Result<Vec<u8>, X509DerCertificateError> {
         use prost::Message;
         use x509_parser::parse_x509_der;
         use X509DerCertificateError::*;
@@ -231,6 +220,60 @@ impl P2PSelfSignedCertificate {
 
         Err(NoneProof)
     }
+
+    // TODO: remove assert!
+    fn salt_pk(cert_pk: &[u8], buf: &mut [u8]) -> usize {
+        let prefix = CERT_P2P_EXT_PK_PREFIX;
+        let spk_len = prefix.len() + cert_pk.len();
+
+        assert!(
+            spk_len < buf.len(),
+            "certificate public key size {} is bigger than {} bytes",
+            spk_len,
+            buf.len()
+        );
+
+        buf[..prefix.len()].copy_from_slice(prefix.as_bytes());
+        buf[prefix.len()..spk_len].copy_from_slice(cert_pk);
+
+        spk_len
+    }
+
+    fn gen_proof(
+        cert_pk: &[u8],
+        host_sk: &[u8],
+        buf: &mut [u8],
+    ) -> Result<usize, X509DerCertificateError> {
+        let len = P2PSelfSignedCertificate::salt_pk(cert_pk, buf);
+        let salt_pk = &buf[..len];
+
+        let host_sk = secp256k1::SecretKey::from_slice(host_sk)?;
+        let msg = secp256k1::Message::from_slice(&keccak256_hash(salt_pk))?;
+
+        let sig = SECP256K1.sign(&msg, &host_sk);
+        let ser_sig = sig.serialize_compact();
+
+        buf[..ser_sig.len()].copy_from_slice(&ser_sig);
+        Ok(ser_sig.len())
+    }
+
+    fn verify_proof(
+        proof: &[u8],
+        cert_pk: &[u8],
+        host_pk: &[u8],
+    ) -> Result<(), X509DerCertificateError> {
+        let mut buf = [0u8; 1000];
+
+        let host_pk = secp256k1::PublicKey::from_slice(host_pk)?;
+        let sig = secp256k1::Signature::from_compact(proof)?;
+
+        let len = P2PSelfSignedCertificate::salt_pk(cert_pk, &mut buf);
+        let salt_pk = &buf[..len];
+
+        let msg = secp256k1::Message::from_slice(&keccak256_hash(salt_pk))?;
+
+        SECP256K1.verify(&msg, &sig, &host_pk).map_err(From::from)
+    }
 }
 
 fn keccak256_hash(obj: &[u8]) -> [u8; 32] {
@@ -245,6 +288,19 @@ fn keccak256_hash(obj: &[u8]) -> [u8; 32] {
     output
 }
 
+fn generate_certificate(
+    buf: &mut [u8],
+) -> Result<(usize, P2PSelfSignedCertificate), Box<dyn StdError>> {
+    let mut os_rng = OsRng::new()?;
+    let (host_sk, host_pk) = SECP256K1.generate_keypair(&mut os_rng);
+    let host_pk_ref: &[u8] = &host_pk.serialize();
+
+    let cert = P2PSelfSignedCertificate::from_host(&host_sk[..], host_pk_ref)?;
+    buf[..host_pk_ref.len()].copy_from_slice(host_pk_ref);
+
+    Ok((host_pk_ref.len(), cert))
+}
+
 /*
  * Ok, we got a basic self-signed certificate now, according to libp2p tls 1.3
  * , we have to implant a OID with our host public key and a signature. We
@@ -252,46 +308,18 @@ fn keccak256_hash(obj: &[u8]) -> [u8; 32] {
  * concatenate with the certificate public key.
  */
 pub fn main() -> Result<(), Box<dyn StdError>> {
-    let mut os_rng = OsRng::new()?;
-    let (host_sk, host_pk) = SECP256K1.generate_keypair(&mut os_rng);
-    let host_pk_ref: &[u8] = &host_pk.serialize();
-    let peer_id = PeerId::from_slice(host_pk_ref)?;
+    let mut ciri_buf = [0u8; 1000];
+    let (len, ciri) = generate_certificate(&mut ciri_buf)?;
+    let ciri_pk = &ciri_buf[..len];
 
-    println!("{:?}", host_pk_ref);
+    let mut geralt_buf = [0u8; 1000];
+    let (len, geralt_cert) = generate_certificate(&mut geralt_buf)?;
+    let geralt_pk = &geralt_buf[..len];
 
-    let cert_kp = rcgen::KeyPair::generate(&rcgen::PKCS_ECDSA_P384_SHA384)?;
-    let cert_pk = cert_kp.public_key_raw();
-
-    let mut buf = [0u8; 1000];
-    let len = P2PSelfSignedCertificate::gen_proof(cert_pk, &host_sk[..], &mut buf)?;
-    let cert_proof = &buf[..len];
-
-    // Now we need to produce this extension blob
-    let signed_key = SignedKey::new(host_pk_ref, cert_proof);
-
-    let mut encoded_key = Vec::new();
-    <SignedKey as prost::Message>::encode(&signed_key, &mut encoded_key)?;
-    let p2p_ext = CustomExtension::from_oid_content(CERT_P2P_EXT_OID, encoded_key);
-
-    // Now we're ready to produce our self-signed certificate
-    let mut cert_params = CertificateParams::default();
-    // Note: use peer id as dns name isn't defined in spec
-    cert_params.subject_alt_names = vec![rcgen::SanType::DnsName(peer_id.string())];
-    cert_params.custom_extensions = vec![p2p_ext];
-    cert_params.is_ca = rcgen::IsCa::SelfSignedOnly;
-    cert_params.alg = &rcgen::PKCS_ECDSA_P384_SHA384;
-    cert_params.key_pair = Some(cert_kp);
-
-    let cert = rcgen::Certificate::from_params(cert_params)?;
-
-    println!("{}", cert.serialize_pem()?);
-    println!("{}", cert.serialize_private_key_pem());
-
-    let remote_host_pubkey =
-        P2PSelfSignedCertificate::verify_cert_ext(cert.serialize_der()?.as_slice())?;
-
-    println!("{:?}", remote_host_pubkey);
+    let alice_pk = P2PSelfSignedCertificate::verify_cert_ext(ciri.serialize_der()?.as_slice())?;
 
     // Now we're gnone try to use rustls to verify it
+    // geralt plays server role, and alice plays client role
+
     Ok(())
 }
