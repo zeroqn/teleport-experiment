@@ -1,0 +1,20 @@
+[package]
+name = "teleport-experiment"
+version = "0.1.0"
+authors = ["user"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+rcgen = "0.7.0"
+secp256k1 = { version = "0.17.0", features = ["rand-std"] }
+rand = "0.6"
+parity-multihash = "0.2.0"
+rand_core = "0.5.1"
+prost = "0.5.0"
+prost-derive = "0.5.0"
+bytes = "0.4"
+tiny-keccak = { version = "2.0.1", features = ["keccak"] }
+multibase = "0.6.0"
+rustls = "0.16.0"
