@@ -107,7 +107,7 @@ impl SignedKey {
     }
 }
 
-struct PeerId(Multihash);
+pub struct PeerId(Multihash);
 
 impl PeerId {
     pub fn from_slice(pk: &[u8]) -> Result<Self, multihash::EncodeError> {
