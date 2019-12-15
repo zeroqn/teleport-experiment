@@ -25,5 +25,5 @@ lazy_static = "1.4.0"
 webpki = "0.21.0"
 futures = "0.3.1"
 # quinn = "0.5.1"
-quinn = { path = "../../repos/quinn/quinn" }
+quinn = { git = "https://github.com/zeroqn/quinn", branch = "expose-certificate" }
 tokio = { version = "0.2.4", features = ["rt-core", "rt-threaded", "time", "macros"] }
